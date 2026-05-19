@@ -1,33 +1,37 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
 from playwright.sync_api import sync_playwright
 import re
 import os
 import time
+import threading
 
 app = Flask(__name__)
 
-TARGET = 8062
+CURRENT_PROFILE_URL = "https://www.instagram.com/kuyeoul/"
+TARGET_PROFILE_URL = "https://www.instagram.com/inyon_yonsei/"
 
-# 🔥 캐시 (서버 안정화 핵심)
+CURRENT_LABEL = "여울"
+TARGET_LABEL = "연세대학교 인연"
+
+FETCH_INTERVAL = 15
+
 cache = {
     "followers": 7421,
-    "timestamp": 0
+    "target": 8062,
+    "timestamp": 0,
+    "status": "starting"
 }
 
-CACHE_TTL = 60  # 60초마다만 인스타 접근
+lock = threading.Lock()
+
 
 HTML = """
 <!DOCTYPE html>
 <html>
-
 <head>
-
     <title>여울 팔로워 트래커</title>
 
-    <meta http-equiv="refresh" content="15">
-
     <style>
-
         body {
             background-color: white;
             font-family: Arial, sans-serif;
@@ -47,7 +51,6 @@ HTML = """
             margin-bottom: 10px;
         }
 
-        /* 🔥 ODOMETER */
         .odometer {
             display: flex;
             justify-content: center;
@@ -97,6 +100,8 @@ HTML = """
         .progress-bar {
             height: 100%;
             background-color: #c8102e;
+            width: {{ percent }}%;
+            transition: width 0.5s ease;
         }
 
         .percent {
@@ -124,8 +129,12 @@ HTML = """
             color: #777;
         }
 
+        .debug {
+            margin-top: 25px;
+            font-size: 16px;
+            color: #aaa;
+        }
     </style>
-
 </head>
 
 <body>
@@ -133,34 +142,39 @@ HTML = """
     <img src="/static/logo.png" class="logo">
 
     <div class="followers-label">
-        여울 현재 팔로워 수
+        {{ current_label }} 현재 팔로워 수
     </div>
 
-    <!-- 🔥 ODOMETER -->
     <div class="odometer" id="odometer"></div>
 
-    <div class="target-number">
-        목표: 연세대학교 인연 (8,062명)
+    <div class="target-number" id="target-number">
+        목표: {{ target_label }} ({{ target_formatted }}명)
     </div>
 
     <div class="progress-container">
-        <div class="progress-bar" style="width: {{ percent }}%;"></div>
+        <div class="progress-bar"></div>
     </div>
 
-    <div class="percent">
+    <div class="percent" id="percent">
         {{ percent }}%
     </div>
 
     <div class="remaining">
-        연세대학교 인연까지 <span>{{ remaining }}</span>!
+        {{ target_label }}까지 <span id="remaining">{{ remaining }}</span>!
     </div>
 
     <div class="subtext">
         목표 달성을 향해 달려가는 중
     </div>
 
+    <div class="debug" id="debug"></div>
 
 <script>
+let lastFollowers = null;
+
+function formatNumber(n) {
+    return Number(n).toLocaleString();
+}
 
 function renderOdometer(number) {
     const el = document.getElementById("odometer");
@@ -187,24 +201,12 @@ function renderOdometer(number) {
     });
 }
 
-window.onload = function () {
-
-    const current = {{ followers }};
-
-    let prev = localStorage.getItem("followers");
-
-    if (!prev) prev = current;
-
-    prev = parseInt(prev);
-
-    let start = prev;
-    let end = current;
-
-    let startTime = performance.now();
+function animateOdometer(start, end) {
+    const startTime = performance.now();
 
     function animate(now) {
-        let progress = Math.min((now - startTime) / 1000, 1);
-        let value = Math.floor(start + (end - start) * progress);
+        const progress = Math.min((now - startTime) / 1000, 1);
+        const value = Math.floor(start + (end - start) * progress);
 
         renderOdometer(value);
 
@@ -214,10 +216,53 @@ window.onload = function () {
     }
 
     requestAnimationFrame(animate);
+}
 
-    localStorage.setItem("followers", current);
+function updateUI(data) {
+    const current = data.followers;
+
+    if (lastFollowers === null) {
+        renderOdometer(current);
+    } else if (current !== lastFollowers) {
+        animateOdometer(lastFollowers, current);
+    }
+
+    lastFollowers = current;
+
+    document.querySelector(".progress-bar").style.width = data.percent + "%";
+    document.getElementById("percent").innerText = data.percent + "%";
+    document.getElementById("remaining").innerText = data.remaining;
+
+    document.getElementById("target-number").innerText =
+        `목표: ${data.target_label} (${formatNumber(data.target)}명)`;
+
+    const updated = data.timestamp
+        ? new Date(data.timestamp * 1000).toLocaleTimeString()
+        : "아직 수집 전";
+
+    document.getElementById("debug").innerText =
+        `status: ${data.status} / current: ${formatNumber(data.followers)} / target: ${formatNumber(data.target)} / updated: ${updated}`;
+}
+
+async function syncFollowers() {
+    try {
+        const res = await fetch("/api/followers?ts=" + Date.now(), {
+            cache: "no-store"
+        });
+
+        const data = await res.json();
+
+        updateUI(data);
+        console.log("[SYNC]", data);
+    } catch (e) {
+        console.error("[SYNC ERROR]", e);
+    }
+}
+
+window.onload = function () {
+    syncFollowers();
+    setInterval(syncFollowers, 3000);
 };
-
 </script>
 
 </body>
@@ -225,63 +270,278 @@ window.onload = function () {
 """
 
 
-def get_followers():
-    global cache
+def parse_count(raw):
+    """
+    예:
+    7,701 -> 7701
+    7.7K -> 7700
+    1.2M -> 1200000
+    """
+    s = raw.strip().replace(",", "").upper()
 
-    now = time.time()
+    if s.endswith("K"):
+        return int(float(s[:-1]) * 1000)
 
-    # 🔥 캐시 사용 (서버 안정화)
-    if now - cache["timestamp"] < CACHE_TTL:
-        return cache["followers"]
+    if s.endswith("M"):
+        return int(float(s[:-1]) * 1000000)
+
+    if s.endswith("B"):
+        return int(float(s[:-1]) * 1000000000)
+
+    return int(float(s))
+
+
+def extract_followers_from_text(text):
+    """
+    실제 렌더링된 body 텍스트에서 followers 숫자 추출.
+    """
+    patterns = [
+        r"([\d,.]+[KMB]?)\s+followers",
+        r"([\d,.]+[KMB]?)\s+Followers",
+        r"팔로워\s*([\d,.]+[KMB]?)",
+        r"([\d,.]+[KMB]?)\s*팔로워",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return parse_count(match.group(1))
+
+    return None
+
+
+def extract_followers_from_meta(page):
+    """
+    og:description은 캐시된 값일 수 있으므로 fallback으로만 사용.
+    """
+    try:
+        desc = page.locator("meta[property='og:description']").get_attribute("content")
+
+        if not desc:
+            return None
+
+        print("[OG DESC]", desc)
+
+        match = re.search(r"([\d,.]+[KMB]?)\s+Followers", desc, re.IGNORECASE)
+
+        if match:
+            return parse_count(match.group(1))
+
+    except Exception as e:
+        print("[META ERROR]", e)
+
+    return None
+
+
+def fetch_followers_from_page(page, url, name):
+    """
+    같은 Playwright page를 재사용해서 특정 Instagram 계정 팔로워 수를 가져옴.
+    body 텍스트 우선, og:description은 fallback.
+    """
+    print(f"[FETCH] {name}: {url}")
+
+    page.goto(
+        url,
+        timeout=30000,
+        wait_until="domcontentloaded"
+    )
+
+    time.sleep(5)
+
+    followers = None
+
+    try:
+        body_text = page.inner_text("body")
+        followers = extract_followers_from_text(body_text)
+
+        if followers is not None:
+            print(f"[BODY UPDATED] {name}: {followers}")
+            return followers
+
+        print(f"[BODY PARSE FAILED] {name}, trying og:description")
+
+    except Exception as e:
+        print(f"[BODY READ ERROR] {name}: {e}")
+
+    followers = extract_followers_from_meta(page)
+
+    if followers is not None:
+        print(f"[OG UPDATED] {name}: {followers}")
+        return followers
+
+    print(f"[PARSE FAILED] {name}")
+    return None
+
+
+def calculate_percent(followers, target):
+    if target <= 0:
+        return 0
+
+    return round((followers / target) * 100, 1)
+
+
+def update_cache(followers=None, target=None, status="ok"):
+    with lock:
+        if followers is not None:
+            cache["followers"] = followers
+
+        if target is not None:
+            cache["target"] = target
+
+        cache["timestamp"] = time.time()
+        cache["status"] = status
+
+
+def update_status(status):
+    with lock:
+        cache["status"] = status
+
+
+def follower_worker():
+    """
+    Playwright 브라우저를 1번만 켜고 계속 재사용.
+    한 루프에서 여울 팔로워와 인연 팔로워를 둘 다 갱신.
+    """
+    print("[WORKER] starting")
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ]
             )
 
-            page = browser.new_page()
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1280, "height": 900},
+            )
 
-            page.goto("https://www.instagram.com/kuyeoul/", timeout=60000)
+            page = context.new_page()
 
-            page.wait_for_selector("meta[property='og:description']", timeout=10000)
+            while True:
+                try:
+                    update_status("fetching_current")
 
-            desc = page.locator("meta[property='og:description']").get_attribute("content")
+                    current_followers = fetch_followers_from_page(
+                        page,
+                        CURRENT_PROFILE_URL,
+                        CURRENT_LABEL
+                    )
 
-            browser.close()
+                    update_status("fetching_target")
 
-            if desc:
-                match = re.search(r"([\d,]+)\sFollowers", desc)
-                if match:
-                    followers = int(match.group(1).replace(",", ""))
+                    target_followers = fetch_followers_from_page(
+                        page,
+                        TARGET_PROFILE_URL,
+                        TARGET_LABEL
+                    )
 
-                    cache["followers"] = followers
-                    cache["timestamp"] = now
+                    if current_followers is not None and target_followers is not None:
+                        update_cache(
+                            followers=current_followers,
+                            target=target_followers,
+                            status="ok"
+                        )
+                        print(f"[UPDATED] current={current_followers}, target={target_followers}")
 
-                    return followers
+                    elif current_followers is not None:
+                        update_cache(
+                            followers=current_followers,
+                            status="target_parse_failed"
+                        )
+                        print(f"[PARTIAL UPDATED] current={current_followers}, target failed")
+
+                    elif target_followers is not None:
+                        update_cache(
+                            target=target_followers,
+                            status="current_parse_failed"
+                        )
+                        print(f"[PARTIAL UPDATED] current failed, target={target_followers}")
+
+                    else:
+                        update_status("parse_failed")
+                        print("[PARSE FAILED] both profiles failed")
+
+                except Exception as e:
+                    update_status(f"error: {str(e)[:80]}")
+                    print("[FETCH ERROR]", e)
+
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+                    page = context.new_page()
+
+                time.sleep(FETCH_INTERVAL)
 
     except Exception as e:
-        print("ERROR:", e)
-
-    return cache["followers"]
+        update_status(f"worker_dead: {str(e)[:80]}")
+        print("[WORKER DEAD]", e)
 
 
 @app.route("/")
 def home():
-    followers = get_followers()
+    with lock:
+        followers = cache["followers"]
+        target = cache["target"]
 
-    percent = round((followers / TARGET) * 100, 1)
-    remaining = TARGET - followers
+    percent = calculate_percent(followers, target)
+    remaining = max(target - followers, 0)
 
     return render_template_string(
         HTML,
         followers=followers,
+        target=target,
+        target_formatted=f"{target:,}",
         percent=percent,
-        remaining=remaining
+        remaining=remaining,
+        current_label=CURRENT_LABEL,
+        target_label=TARGET_LABEL
     )
 
 
+@app.route("/api/followers")
+def api_followers():
+    with lock:
+        followers = cache["followers"]
+        target = cache["target"]
+        timestamp = cache["timestamp"]
+        status = cache["status"]
+
+    percent = calculate_percent(followers, target)
+    remaining = max(target - followers, 0)
+
+    return jsonify({
+        "followers": followers,
+        "target": target,
+        "percent": percent,
+        "remaining": remaining,
+        "timestamp": timestamp,
+        "status": status,
+        "current_label": CURRENT_LABEL,
+        "target_label": TARGET_LABEL
+    })
+
+
 if __name__ == "__main__":
+    t = threading.Thread(target=follower_worker, daemon=True)
+    t.start()
+
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
