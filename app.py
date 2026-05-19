@@ -2,15 +2,23 @@ from flask import Flask, render_template_string
 from playwright.sync_api import sync_playwright
 import re
 import os
+import time
 
 app = Flask(__name__)
 
 TARGET = 8062
 
+# 🔥 캐시 (핵심)
+cache = {
+    "followers": 7421,
+    "timestamp": 0
+}
+
+CACHE_TTL = 60  # 60초마다만 인스타 접근
+
 HTML = """
 <!DOCTYPE html>
 <html>
-
 <head>
     <title>여울 팔로워 트래커</title>
     <meta http-equiv="refresh" content="15">
@@ -24,116 +32,130 @@ HTML = """
             padding-top: 60px;
         }
 
-        .logo {
-            width: 320px;
-            margin-bottom: 40px;
-        }
-
-        .followers-label {
-            font-size: 28px;
-            color: #555;
-            margin-bottom: 10px;
-        }
-
-        .followers {
+        .odometer {
+            display: flex;
+            justify-content: center;
+            gap: 6px;
             font-size: 140px;
             font-weight: bold;
-            color: #111;
-            line-height: 1;
         }
 
-        .followers span {
-            font-size: 50px;
-            margin-left: 10px;
+        .digit {
+            width: 70px;
+            height: 140px;
+            overflow: hidden;
+            position: relative;
         }
 
-        .target-number {
-            font-size: 55px;
-            font-weight: bold;
-            color: #a00020;
-            margin-top: 10px;
+        .digit-inner {
+            position: absolute;
+            transition: transform 0.6s ease;
+        }
+
+        .num {
+            height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .progress-container {
             width: 80%;
             height: 45px;
-            background-color: #e5e5e5;
+            background: #e5e5e5;
             margin: 50px auto;
             border-radius: 30px;
-            overflow: hidden;
         }
 
         .progress-bar {
             height: 100%;
-            background-color: #c8102e;
-        }
-
-        .percent {
-            font-size: 36px;
-            font-weight: bold;
-            color: #c8102e;
-            margin-top: -20px;
-        }
-
-        .remaining {
-            margin-top: 60px;
-            font-size: 60px;
-            font-weight: bold;
-            color: #111;
-        }
-
-        .remaining span {
-            color: #c8102e;
-            font-size: 90px;
-        }
-
-        .subtext {
-            margin-top: 30px;
-            font-size: 28px;
-            color: #777;
+            background: #c8102e;
         }
     </style>
 </head>
 
 <body>
 
-    <img src="/static/logo.png" class="logo">
+<h1>여울 팔로워</h1>
 
-    <div class="followers-label">
-        여울 현재 팔로워 수
-    </div>
+<div class="odometer" id="odometer"></div>
 
-    <div class="followers">
-        {{ followers }}<span>명</span>
-    </div>
+<div class="progress-container">
+    <div class="progress-bar" style="width: {{ percent }}%;"></div>
+</div>
 
-    <div class="target-number">
-        목표: 연세대학교 인연 (8,062명)
-    </div>
+<div>{{ percent }}%</div>
 
-    <div class="progress-container">
-        <div class="progress-bar" style="width: {{ percent }}%;"></div>
-    </div>
+<div>목표까지 {{ remaining }}명</div>
 
-    <div class="percent">
-        {{ percent }}%
-    </div>
+<script>
+function renderOdometer(number) {
+    const el = document.getElementById("odometer");
+    el.innerHTML = "";
 
-    <div class="remaining">
-        연세대학교 인연까지 <span>{{ remaining }}</span>!
-    </div>
+    String(number).split("").forEach(d => {
+        const wrap = document.createElement("div");
+        wrap.className = "digit";
 
-    <div class="subtext">
-        목표 달성을 향해 달려가는 중
-    </div>
+        const inner = document.createElement("div");
+        inner.className = "digit-inner";
+
+        for (let i = 0; i <= 9; i++) {
+            const num = document.createElement("div");
+            num.className = "num";
+            num.innerText = i;
+            inner.appendChild(num);
+        }
+
+        inner.style.transform = `translateY(-${d * 140}px)`;
+
+        wrap.appendChild(inner);
+        el.appendChild(wrap);
+    });
+}
+
+window.onload = function () {
+    const current = {{ followers }};
+    let prev = localStorage.getItem("followers") || current;
+
+    prev = parseInt(prev);
+
+    let start = prev;
+    let end = current;
+
+    let startTime = performance.now();
+
+    function animate(now) {
+        let progress = Math.min((now - startTime) / 1000, 1);
+        let value = Math.floor(start + (end - start) * progress);
+
+        renderOdometer(value);
+
+        if (progress < 1) {
+            requestAnimationFrame(animate);
+        }
+    }
+
+    requestAnimationFrame(animate);
+
+    localStorage.setItem("followers", current);
+};
+</script>
 
 </body>
-
 </html>
 """
 
 
 def get_followers():
+    global cache
+
+    now = time.time()
+
+    # 🔥 캐시 사용
+    if now - cache["timestamp"] < CACHE_TTL:
+        return cache["followers"]
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -142,30 +164,28 @@ def get_followers():
             )
 
             page = browser.new_page()
+            page.goto("https://www.instagram.com/kuyeoul/", timeout=60000)
 
-            url = "https://www.instagram.com/kuyeoul/"
-            page.goto(url, timeout=60000)
-
-            # 안정적으로 meta 태그 로딩 대기
             page.wait_for_selector("meta[property='og:description']", timeout=10000)
 
             desc = page.locator("meta[property='og:description']").get_attribute("content")
 
             browser.close()
 
-            if not desc:
-                return 7421
+            if desc:
+                match = re.search(r"([\d,]+)\sFollowers", desc)
+                if match:
+                    followers = int(match.group(1).replace(",", ""))
 
-            match = re.search(r"([\d,]+)\sFollowers", desc)
+                    cache["followers"] = followers
+                    cache["timestamp"] = now
 
-            if match:
-                return int(match.group(1).replace(",", ""))
-
-            return 7421
+                    return followers
 
     except Exception as e:
         print("ERROR:", e)
-        return 7421
+
+    return cache["followers"]
 
 
 @app.route("/")
