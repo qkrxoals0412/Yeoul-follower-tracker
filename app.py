@@ -1,25 +1,20 @@
-from flask import Flask, render_template_string, jsonify
-from playwright.sync_api import sync_playwright
-import re
+from flask import Flask, render_template_string, jsonify, request
 import os
 import time
 import threading
 
 app = Flask(__name__)
 
-CURRENT_PROFILE_URL = "https://www.instagram.com/kuyeoul/"
-TARGET_PROFILE_URL = "https://www.instagram.com/inyon_yonsei/"
-
 CURRENT_LABEL = "여울"
 TARGET_LABEL = "연세대학교 인연"
 
-FETCH_INTERVAL = 15
+UPDATE_SECRET = os.environ.get("UPDATE_SECRET", "123kjh123k0b87sdfalj3n24rbbv087b0a8d7u")
 
 cache = {
     "followers": 7421,
     "target": 8062,
     "timestamp": 0,
-    "status": "starting"
+    "status": "waiting_for_local_update",
 }
 
 lock = threading.Lock()
@@ -122,18 +117,6 @@ HTML = """
             color: #c8102e;
             font-size: 90px;
         }
-
-        .subtext {
-            margin-top: 30px;
-            font-size: 28px;
-            color: #777;
-        }
-
-        .debug {
-            margin-top: 25px;
-            font-size: 16px;
-            color: #aaa;
-        }
     </style>
 </head>
 
@@ -162,12 +145,6 @@ HTML = """
     <div class="remaining">
         {{ target_label }}까지 <span id="remaining">{{ remaining }}</span>!
     </div>
-
-    <div class="subtext">
-        목표 달성을 향해 달려가는 중
-    </div>
-
-    <div class="debug" id="debug"></div>
 
 <script>
 let lastFollowers = null;
@@ -235,13 +212,6 @@ function updateUI(data) {
 
     document.getElementById("target-number").innerText =
         `목표: ${data.target_label} (${formatNumber(data.target)}명)`;
-
-    const updated = data.timestamp
-        ? new Date(data.timestamp * 1000).toLocaleTimeString()
-        : "아직 수집 전";
-
-    document.getElementById("debug").innerText =
-        `status: ${data.status} / current: ${formatNumber(data.followers)} / target: ${formatNumber(data.target)} / updated: ${updated}`;
 }
 
 async function syncFollowers() {
@@ -251,9 +221,7 @@ async function syncFollowers() {
         });
 
         const data = await res.json();
-
         updateUI(data);
-        console.log("[SYNC]", data);
     } catch (e) {
         console.error("[SYNC ERROR]", e);
     }
@@ -270,223 +238,18 @@ window.onload = function () {
 """
 
 
-def parse_count(raw):
-    """
-    예:
-    7,701 -> 7701
-    7.7K -> 7700
-    1.2M -> 1200000
-    """
-    s = raw.strip().replace(",", "").upper()
-
-    if s.endswith("K"):
-        return int(float(s[:-1]) * 1000)
-
-    if s.endswith("M"):
-        return int(float(s[:-1]) * 1000000)
-
-    if s.endswith("B"):
-        return int(float(s[:-1]) * 1000000000)
-
-    return int(float(s))
-
-
-def extract_followers_from_text(text):
-    """
-    실제 렌더링된 body 텍스트에서 followers 숫자 추출.
-    """
-    patterns = [
-        r"([\d,.]+[KMB]?)\s+followers",
-        r"([\d,.]+[KMB]?)\s+Followers",
-        r"팔로워\s*([\d,.]+[KMB]?)",
-        r"([\d,.]+[KMB]?)\s*팔로워",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return parse_count(match.group(1))
-
-    return None
-
-
-def extract_followers_from_meta(page):
-    """
-    og:description은 캐시된 값일 수 있으므로 fallback으로만 사용.
-    """
-    try:
-        desc = page.locator("meta[property='og:description']").get_attribute("content")
-
-        if not desc:
-            return None
-
-        print("[OG DESC]", desc)
-
-        match = re.search(r"([\d,.]+[KMB]?)\s+Followers", desc, re.IGNORECASE)
-
-        if match:
-            return parse_count(match.group(1))
-
-    except Exception as e:
-        print("[META ERROR]", e)
-
-    return None
-
-
-def fetch_followers_from_page(page, url, name):
-    """
-    같은 Playwright page를 재사용해서 특정 Instagram 계정 팔로워 수를 가져옴.
-    body 텍스트 우선, og:description은 fallback.
-    """
-    print(f"[FETCH] {name}: {url}")
-
-    page.goto(
-        url,
-        timeout=30000,
-        wait_until="domcontentloaded"
-    )
-
-    time.sleep(5)
-
-    followers = None
-
-    try:
-        body_text = page.inner_text("body")
-        followers = extract_followers_from_text(body_text)
-
-        if followers is not None:
-            print(f"[BODY UPDATED] {name}: {followers}")
-            return followers
-
-        print(f"[BODY PARSE FAILED] {name}, trying og:description")
-
-    except Exception as e:
-        print(f"[BODY READ ERROR] {name}: {e}")
-
-    followers = extract_followers_from_meta(page)
-
-    if followers is not None:
-        print(f"[OG UPDATED] {name}: {followers}")
-        return followers
-
-    print(f"[PARSE FAILED] {name}")
-    return None
-
-
 def calculate_percent(followers, target):
     if target <= 0:
         return 0
-
     return round((followers / target) * 100, 1)
 
 
-def update_cache(followers=None, target=None, status="ok"):
+def update_cache(followers, target, status="updated"):
     with lock:
-        if followers is not None:
-            cache["followers"] = followers
-
-        if target is not None:
-            cache["target"] = target
-
+        cache["followers"] = followers
+        cache["target"] = target
         cache["timestamp"] = time.time()
         cache["status"] = status
-
-
-def update_status(status):
-    with lock:
-        cache["status"] = status
-
-
-def follower_worker():
-    """
-    Playwright 브라우저를 1번만 켜고 계속 재사용.
-    한 루프에서 여울 팔로워와 인연 팔로워를 둘 다 갱신.
-    """
-    print("[WORKER] starting")
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
-
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                locale="en-US",
-                viewport={"width": 1280, "height": 900},
-            )
-
-            page = context.new_page()
-
-            while True:
-                try:
-                    update_status("fetching_current")
-
-                    current_followers = fetch_followers_from_page(
-                        page,
-                        CURRENT_PROFILE_URL,
-                        CURRENT_LABEL
-                    )
-
-                    update_status("fetching_target")
-
-                    target_followers = fetch_followers_from_page(
-                        page,
-                        TARGET_PROFILE_URL,
-                        TARGET_LABEL
-                    )
-
-                    if current_followers is not None and target_followers is not None:
-                        update_cache(
-                            followers=current_followers,
-                            target=target_followers,
-                            status="ok"
-                        )
-                        print(f"[UPDATED] current={current_followers}, target={target_followers}")
-
-                    elif current_followers is not None:
-                        update_cache(
-                            followers=current_followers,
-                            status="target_parse_failed"
-                        )
-                        print(f"[PARTIAL UPDATED] current={current_followers}, target failed")
-
-                    elif target_followers is not None:
-                        update_cache(
-                            target=target_followers,
-                            status="current_parse_failed"
-                        )
-                        print(f"[PARTIAL UPDATED] current failed, target={target_followers}")
-
-                    else:
-                        update_status("parse_failed")
-                        print("[PARSE FAILED] both profiles failed")
-
-                except Exception as e:
-                    update_status(f"error: {str(e)[:80]}")
-                    print("[FETCH ERROR]", e)
-
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-
-                    page = context.new_page()
-
-                time.sleep(FETCH_INTERVAL)
-
-    except Exception as e:
-        update_status(f"worker_dead: {str(e)[:80]}")
-        print("[WORKER DEAD]", e)
 
 
 @app.route("/")
@@ -506,7 +269,7 @@ def home():
         percent=percent,
         remaining=remaining,
         current_label=CURRENT_LABEL,
-        target_label=TARGET_LABEL
+        target_label=TARGET_LABEL,
     )
 
 
@@ -529,19 +292,50 @@ def api_followers():
         "timestamp": timestamp,
         "status": status,
         "current_label": CURRENT_LABEL,
-        "target_label": TARGET_LABEL
+        "target_label": TARGET_LABEL,
+    })
+
+
+@app.route("/update", methods=["POST"])
+def update_from_local():
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid json"}), 400
+
+    if data.get("secret") != UPDATE_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    followers = data.get("followers")
+    target = data.get("target")
+
+    if not isinstance(followers, int) or not isinstance(target, int):
+        return jsonify({"ok": False, "error": "followers and target must be int"}), 400
+
+    update_cache(
+        followers=followers,
+        target=target,
+        status="updated_from_local",
+    )
+
+    print(
+        f"[UPDATE] followers={followers}, target={target}",
+        flush=True,
+    )
+
+    return jsonify({
+        "ok": True,
+        "followers": followers,
+        "target": target,
     })
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=follower_worker, daemon=True)
-    t.start()
-
     port = int(os.environ.get("PORT", 5000))
 
     app.run(
         host="0.0.0.0",
         port=port,
         debug=False,
-        use_reloader=False
+        use_reloader=False,
     )
