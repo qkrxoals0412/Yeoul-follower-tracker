@@ -12,13 +12,10 @@ HTML = """
 <html>
 
 <head>
-
     <title>여울 팔로워 트래커</title>
-
     <meta http-equiv="refresh" content="15">
 
     <style>
-
         body {
             background-color: white;
             font-family: Arial, sans-serif;
@@ -95,9 +92,7 @@ HTML = """
             font-size: 28px;
             color: #777;
         }
-
     </style>
-
 </head>
 
 <body>
@@ -137,12 +132,10 @@ HTML = """
 </html>
 """
 
+
 def get_followers():
-
     try:
-
         with sync_playwright() as p:
-
             browser = p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox"]
@@ -150,34 +143,36 @@ def get_followers():
 
             page = browser.new_page()
 
-            page.goto(
-                "https://www.instagram.com/kuyeoul/",
-                timeout=60000
-            )
+            url = "https://www.instagram.com/kuyeoul/"
+            page.goto(url, timeout=60000)
 
-            page.wait_for_timeout(5000)
+            # 안정적으로 meta 태그 로딩 대기
+            page.wait_for_selector("meta[property='og:description']", timeout=10000)
 
-            title = page.title()
+            desc = page.locator("meta[property='og:description']").get_attribute("content")
 
             browser.close()
 
-            match = re.search(r'([\\d,]+)\\sFollowers', title)
+            if not desc:
+                return 7421
+
+            match = re.search(r"([\d,]+)\sFollowers", desc)
 
             if match:
                 return int(match.group(1).replace(",", ""))
 
             return 7421
 
-    except:
+    except Exception as e:
+        print("ERROR:", e)
         return 7421
+
 
 @app.route("/")
 def home():
-
     followers = get_followers()
 
     percent = round((followers / TARGET) * 100, 1)
-
     remaining = TARGET - followers
 
     return render_template_string(
@@ -186,6 +181,7 @@ def home():
         percent=percent,
         remaining=remaining
     )
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
