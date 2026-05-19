@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 TARGET = 8062
 
-# 🔥 캐시 (핵심)
+# 🔥 캐시 (서버 안정화 핵심)
 cache = {
     "followers": 7421,
     "timestamp": 0
@@ -19,11 +19,15 @@ CACHE_TTL = 60  # 60초마다만 인스타 접근
 HTML = """
 <!DOCTYPE html>
 <html>
+
 <head>
+
     <title>여울 팔로워 트래커</title>
+
     <meta http-equiv="refresh" content="15">
 
     <style>
+
         body {
             background-color: white;
             font-family: Arial, sans-serif;
@@ -32,12 +36,25 @@ HTML = """
             padding-top: 60px;
         }
 
+        .logo {
+            width: 320px;
+            margin-bottom: 40px;
+        }
+
+        .followers-label {
+            font-size: 28px;
+            color: #555;
+            margin-bottom: 10px;
+        }
+
+        /* 🔥 ODOMETER */
         .odometer {
             display: flex;
             justify-content: center;
             gap: 6px;
             font-size: 140px;
             font-weight: bold;
+            color: #111;
         }
 
         .digit {
@@ -49,6 +66,8 @@ HTML = """
 
         .digit-inner {
             position: absolute;
+            top: 0;
+            left: 0;
             transition: transform 0.6s ease;
         }
 
@@ -59,36 +78,90 @@ HTML = """
             justify-content: center;
         }
 
+        .target-number {
+            font-size: 55px;
+            font-weight: bold;
+            color: #a00020;
+            margin-top: 10px;
+        }
+
         .progress-container {
             width: 80%;
             height: 45px;
-            background: #e5e5e5;
+            background-color: #e5e5e5;
             margin: 50px auto;
             border-radius: 30px;
+            overflow: hidden;
         }
 
         .progress-bar {
             height: 100%;
-            background: #c8102e;
+            background-color: #c8102e;
         }
+
+        .percent {
+            font-size: 36px;
+            font-weight: bold;
+            color: #c8102e;
+            margin-top: -20px;
+        }
+
+        .remaining {
+            margin-top: 60px;
+            font-size: 60px;
+            font-weight: bold;
+            color: #111;
+        }
+
+        .remaining span {
+            color: #c8102e;
+            font-size: 90px;
+        }
+
+        .subtext {
+            margin-top: 30px;
+            font-size: 28px;
+            color: #777;
+        }
+
     </style>
+
 </head>
 
 <body>
 
-<h1>여울 팔로워</h1>
+    <img src="/static/logo.png" class="logo">
 
-<div class="odometer" id="odometer"></div>
+    <div class="followers-label">
+        여울 현재 팔로워 수
+    </div>
 
-<div class="progress-container">
-    <div class="progress-bar" style="width: {{ percent }}%;"></div>
-</div>
+    <!-- 🔥 ODOMETER -->
+    <div class="odometer" id="odometer"></div>
 
-<div>{{ percent }}%</div>
+    <div class="target-number">
+        목표: 연세대학교 인연 (8,062명)
+    </div>
 
-<div>목표까지 {{ remaining }}명</div>
+    <div class="progress-container">
+        <div class="progress-bar" style="width: {{ percent }}%;"></div>
+    </div>
+
+    <div class="percent">
+        {{ percent }}%
+    </div>
+
+    <div class="remaining">
+        연세대학교 인연까지 <span>{{ remaining }}</span>!
+    </div>
+
+    <div class="subtext">
+        목표 달성을 향해 달려가는 중
+    </div>
+
 
 <script>
+
 function renderOdometer(number) {
     const el = document.getElementById("odometer");
     el.innerHTML = "";
@@ -115,8 +188,12 @@ function renderOdometer(number) {
 }
 
 window.onload = function () {
+
     const current = {{ followers }};
-    let prev = localStorage.getItem("followers") || current;
+
+    let prev = localStorage.getItem("followers");
+
+    if (!prev) prev = current;
 
     prev = parseInt(prev);
 
@@ -140,6 +217,7 @@ window.onload = function () {
 
     localStorage.setItem("followers", current);
 };
+
 </script>
 
 </body>
@@ -152,7 +230,7 @@ def get_followers():
 
     now = time.time()
 
-    # 🔥 캐시 사용
+    # 🔥 캐시 사용 (서버 안정화)
     if now - cache["timestamp"] < CACHE_TTL:
         return cache["followers"]
 
@@ -164,6 +242,7 @@ def get_followers():
             )
 
             page = browser.new_page()
+
             page.goto("https://www.instagram.com/kuyeoul/", timeout=60000)
 
             page.wait_for_selector("meta[property='og:description']", timeout=10000)
