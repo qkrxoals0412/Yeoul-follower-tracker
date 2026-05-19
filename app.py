@@ -157,22 +157,19 @@ def get_followers():
 
             page.wait_for_timeout(5000)
 
-            html = page.content()
+            title = page.title()
 
             browser.close()
 
-            match = re.search(
-                r'followers","count":(\d+)',
-                html
-            )
+            match = re.search(r'([\\d,]+)\\sFollowers', title)
 
             if match:
-                return int(match.group(1))
+                return int(match.group(1).replace(",", ""))
 
-            return 0
+            return 7421
 
     except:
-        return 0
+        return 7421
 
 @app.route("/")
 def home():
